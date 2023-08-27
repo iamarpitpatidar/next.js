@@ -17,7 +17,7 @@ import findUp from 'next/dist/compiled/find-up'
 import { buildCustomRoute } from './filesystem'
 import * as Log from '../../../build/output/log'
 import HotReloader, { matchNextPageBundleRequest } from '../../dev/hot-reloader'
-import { traceGlobals } from '../../../trace/shared'
+import { setGlobal } from '../../../trace/shared'
 import { Telemetry } from '../../../telemetry/storage'
 import { IncomingMessage, ServerResponse } from 'http'
 import loadJsConfig from '../../../build/load-jsconfig'
@@ -27,7 +27,10 @@ import { getDefineEnv } from '../../../build/webpack-config'
 import { logAppDirError } from '../../dev/log-app-dir-error'
 import { UnwrapPromise } from '../../../lib/coalesced-function'
 import { getSortedRoutes } from '../../../shared/lib/router/utils'
-import { getStaticInfoIncludingLayouts } from '../../../build/entries'
+import {
+  getStaticInfoIncludingLayouts,
+  sortByPageExts,
+} from '../../../build/entries'
 import { verifyTypeScriptSetup } from '../../../lib/verifyTypeScriptSetup'
 import { verifyPartytownSetup } from '../../../lib/verify-partytown-setup'
 import { getRouteRegex } from '../../../shared/lib/router/utils/route-regex'
@@ -48,6 +51,7 @@ import {
   COMPILER_NAMES,
   DEV_CLIENT_PAGES_MANIFEST,
   DEV_MIDDLEWARE_MANIFEST,
+  MIDDLEWARE_MANIFEST,
   NEXT_FONT_MANIFEST,
   PAGES_MANIFEST,
   PHASE_DEVELOPMENT_SERVER,
@@ -78,8 +82,14 @@ import { PagesManifest } from '../../../build/webpack/plugins/pages-manifest-plu
 import { AppBuildManifest } from '../../../build/webpack/plugins/app-build-manifest-plugin'
 import { PageNotFoundError } from '../../../shared/lib/utils'
 import { srcEmptySsgManifest } from '../../../build/webpack/plugins/build-manifest-plugin'
+import { PropagateToWorkersField } from './types'
+import { MiddlewareManifest } from '../../../build/webpack/plugins/middleware-plugin'
+import { devPageFiles } from '../../../build/webpack/plugins/next-types-plugin/shared'
+import type { RenderWorkers } from '../router-server'
+import { pathToRegexp } from 'next/dist/compiled/path-to-regexp'
 
 type SetupOpts = {
+  renderWorkers: RenderWorkers
   dir: string
   turbo?: boolean
   appDir?: string
@@ -118,23 +128,35 @@ async function startWatcher(opts: SetupOpts) {
 
   const distDir = path.join(opts.dir, opts.nextConfig.distDir)
 
-  traceGlobals.set('distDir', distDir)
-  traceGlobals.set('phase', PHASE_DEVELOPMENT_SERVER)
+  setGlobal('distDir', distDir)
+  setGlobal('phase', PHASE_DEVELOPMENT_SERVER)
 
   const validFileMatcher = createValidFileMatcher(
     nextConfig.pageExtensions,
     appDir
   )
 
-  const renderWorkers: {
-    app?: import('../router-server').RenderWorker
-    pages?: import('../router-server').RenderWorker
-  } = {}
-
-  async function propagateToWorkers(field: string, args: any) {
-    await renderWorkers.app?.propagateServerField(field, args)
-    await renderWorkers.pages?.propagateServerField(field, args)
+  async function propagateToWorkers(field: PropagateToWorkersField, args: any) {
+    await opts.renderWorkers.app?.propagateServerField(field, args)
+    await opts.renderWorkers.pages?.propagateServerField(field, args)
   }
+
+  const serverFields: {
+    actualMiddlewareFile?: string | undefined
+    actualInstrumentationHookFile?: string | undefined
+    appPathRoutes?: Record<string, string | string[]>
+    middleware?:
+      | {
+          page: string
+          match: MiddlewareRouteMatch
+          matchers?: MiddlewareMatcher[]
+        }
+      | undefined
+    hasAppNotFound?: boolean
+    interceptionRoutes?: ReturnType<
+      typeof import('./filesystem').buildCustomRoute
+    >[]
+  } = {}
 
   let hotReloader: InstanceType<typeof HotReloader>
 
@@ -165,10 +187,153 @@ async function startWatcher(opts: SetupOpts) {
       document: undefined,
       error: undefined,
     }
+    let currentEntriesHandlingResolve: ((value?: unknown) => void) | undefined
+    let currentEntriesHandling = new Promise(
+      (resolve) => (currentEntriesHandlingResolve = resolve)
+    )
+
+    const issues = new Map<string, Set<string>>()
+
+    async function processResult(
+      key: string,
+      result: TurbopackResult<WrittenEndpoint> | undefined
+    ): Promise<TurbopackResult<WrittenEndpoint> | undefined> {
+      if (result) {
+        await (global as any)._nextDeleteCache?.(
+          result.serverPaths
+            .map((p) => path.join(distDir, p))
+            .concat([
+              // We need to clear the chunk cache in react
+              require.resolve(
+                'next/dist/compiled/react-server-dom-webpack/cjs/react-server-dom-webpack-client.edge.development.js'
+              ),
+              // And this redirecting module as well
+              require.resolve(
+                'next/dist/compiled/react-server-dom-webpack/client.edge.js'
+              ),
+            ])
+        )
+
+        const oldSet = issues.get(key) ?? new Set()
+        const newSet = new Set<string>()
+
+        for (const issue of result.issues) {
+          // TODO better formatting
+          if (issue.severity !== 'error' && issue.severity !== 'fatal') continue
+          const issueKey = `${issue.severity} - ${issue.filePath} - ${issue.title}\n${issue.description}\n\n`
+          if (!oldSet.has(issueKey)) {
+            console.error(
+              `  ⚠ ${key} ${issue.severity} - ${
+                issue.filePath
+              }\n    ${issue.title.replace(
+                /\n/g,
+                '\n    '
+              )}\n    ${issue.description.replace(/\n/g, '\n    ')}\n\n`
+            )
+          }
+          newSet.add(issueKey)
+        }
+        for (const issue of oldSet) {
+          if (!newSet.has(issue)) {
+            console.error(`✅ ${key} fixed ${issue}`)
+          }
+        }
+
+        issues.set(key, newSet)
+      }
+      return result
+    }
+
+    const clearCache = (filePath: string) =>
+      (global as any)._nextDeleteCache?.([filePath])
+
+    async function loadPartialManifest<T>(
+      name: string,
+      pageName: string,
+      type: 'pages' | 'app' | 'app-route' | 'middleware' = 'pages'
+    ): Promise<T> {
+      const manifestPath = path.posix.join(
+        distDir,
+        `server`,
+        type === 'app-route' ? 'app' : type,
+        type === 'middleware'
+          ? ''
+          : pageName === '/' && type === 'pages'
+          ? 'index'
+          : pageName,
+        pageName === '/_not-found' || pageName === '/not-found'
+          ? ''
+          : type === 'app'
+          ? 'page'
+          : type === 'app-route'
+          ? 'route'
+          : '',
+        name
+      )
+      return JSON.parse(
+        await readFile(path.posix.join(manifestPath), 'utf-8')
+      ) as T
+    }
+
+    const buildManifests = new Map<string, BuildManifest>()
+    const appBuildManifests = new Map<string, AppBuildManifest>()
+    const pagesManifests = new Map<string, PagesManifest>()
+    const appPathsManifests = new Map<string, PagesManifest>()
+    const middlewareManifests = new Map<string, MiddlewareManifest>()
+
+    async function loadMiddlewareManifest(
+      pageName: string,
+      type: 'pages' | 'app' | 'app-route' | 'middleware'
+    ): Promise<void> {
+      middlewareManifests.set(
+        pageName,
+        await loadPartialManifest(MIDDLEWARE_MANIFEST, pageName, type)
+      )
+    }
+
+    async function loadBuildManifest(
+      pageName: string,
+      type: 'app' | 'pages' = 'pages'
+    ): Promise<void> {
+      buildManifests.set(
+        pageName,
+        await loadPartialManifest(BUILD_MANIFEST, pageName, type)
+      )
+    }
+
+    async function loadAppBuildManifest(pageName: string): Promise<void> {
+      appBuildManifests.set(
+        pageName,
+        await loadPartialManifest(APP_BUILD_MANIFEST, pageName, 'app')
+      )
+    }
+
+    async function loadPagesManifest(pageName: string): Promise<void> {
+      pagesManifests.set(
+        pageName,
+        await loadPartialManifest(PAGES_MANIFEST, pageName)
+      )
+    }
+
+    async function loadAppPathManifest(
+      pageName: string,
+      type: 'app' | 'app-route' = 'app'
+    ): Promise<void> {
+      appPathsManifests.set(
+        pageName,
+        await loadPartialManifest(APP_PATHS_MANIFEST, pageName, type)
+      )
+    }
 
     try {
       async function handleEntries() {
         for await (const entrypoints of iter) {
+          if (!currentEntriesHandlingResolve) {
+            currentEntriesHandling = new Promise(
+              // eslint-disable-next-line no-loop-func
+              (resolve) => (currentEntriesHandlingResolve = resolve)
+            )
+          }
           globalEntries.app = entrypoints.pagesAppEndpoint
           globalEntries.document = entrypoints.pagesDocumentEndpoint
           globalEntries.error = entrypoints.pagesErrorEndpoint
@@ -189,6 +354,33 @@ async function startWatcher(opts: SetupOpts) {
                 break
             }
           }
+
+          if (entrypoints.middleware) {
+            await processResult(
+              'middleware',
+              await entrypoints.middleware.endpoint.writeToDisk()
+            )
+            await loadMiddlewareManifest('middleware', 'middleware')
+            serverFields.actualMiddlewareFile = 'middleware'
+            serverFields.middleware = {
+              match: null as any,
+              page: '/',
+              matchers:
+                middlewareManifests.get('middleware')?.middleware['/'].matchers,
+            }
+          } else {
+            middlewareManifests.delete('middleware')
+            serverFields.actualMiddlewareFile = undefined
+            serverFields.middleware = undefined
+          }
+          await propagateToWorkers(
+            'actualMiddlewareFile',
+            serverFields.actualMiddlewareFile
+          )
+          await propagateToWorkers('middleware', serverFields.middleware)
+
+          currentEntriesHandlingResolve!()
+          currentEntriesHandlingResolve = undefined
         }
       }
       handleEntries().catch((err) => {
@@ -198,11 +390,6 @@ async function startWatcher(opts: SetupOpts) {
     } catch (e) {
       console.error(e)
     }
-
-    const buildManifests = new Map<string, BuildManifest>()
-    const appBuildManifests = new Map<string, AppBuildManifest>()
-    const pagesManifests = new Map<string, PagesManifest>()
-    const appPathsManifests = new Map<string, PagesManifest>()
 
     function mergeBuildManifests(manifests: Iterable<BuildManifest>) {
       const manifest: Partial<BuildManifest> & Pick<BuildManifest, 'pages'> = {
@@ -245,38 +432,35 @@ async function startWatcher(opts: SetupOpts) {
       return manifest
     }
 
-    async function processResult(
-      result: TurbopackResult<WrittenEndpoint> | undefined
-    ): Promise<TurbopackResult<WrittenEndpoint> | undefined> {
-      if (result) {
-        await (global as any)._nextDeleteCache?.(
-          result.serverPaths
-            .map((p) => path.join(distDir, p))
-            .concat([
-              // We need to clear the chunk cache in react
-              require.resolve(
-                'next/dist/compiled/react-server-dom-webpack/cjs/react-server-dom-webpack-client.edge.development.js'
-              ),
-              // And this redirecting module as well
-              require.resolve(
-                'next/dist/compiled/react-server-dom-webpack/client.edge.js'
-              ),
-            ])
-        )
-
-        for (const issue of result.issues) {
-          // TODO better formatting
-          if (issue.severity !== 'error' && issue.severity !== 'fatal') continue
-          console.error(
-            `⚠ ${issue.severity} - ${issue.filePath}\n${issue.title}\n${issue.description}\n\n`
-          )
+    function mergeMiddlewareManifests(
+      manifests: Iterable<MiddlewareManifest>
+    ): MiddlewareManifest {
+      const manifest: MiddlewareManifest = {
+        version: 2,
+        middleware: {},
+        sortedMiddleware: [],
+        functions: {},
+      }
+      for (const m of manifests) {
+        Object.assign(manifest.functions, m.functions)
+        Object.assign(manifest.middleware, m.middleware)
+      }
+      for (const fun of Object.values(manifest.functions).concat(
+        Object.values(manifest.middleware)
+      )) {
+        for (const matcher of fun.matchers) {
+          if (!matcher.regexp) {
+            matcher.regexp = pathToRegexp(matcher.originalSource, [], {
+              delimiter: '/',
+              sensitive: false,
+              strict: true,
+            }).source.replaceAll('\\/', '/')
+          }
         }
       }
-      return result
+      manifest.sortedMiddleware = Object.keys(manifest.middleware)
+      return manifest
     }
-
-    const clearCache = (filePath: string) =>
-      (global as any)._nextDeleteCache?.([filePath])
 
     async function writeBuildManifest(): Promise<void> {
       const buildManifest = mergeBuildManifests(buildManifests.values())
@@ -352,6 +536,9 @@ async function startWatcher(opts: SetupOpts) {
     }
 
     async function writeMiddlewareManifest(): Promise<void> {
+      const middlewareManifest = mergeMiddlewareManifests(
+        middlewareManifests.values()
+      )
       const middlewareManifestPath = path.join(
         distDir,
         'server/middleware-manifest.json'
@@ -359,16 +546,7 @@ async function startWatcher(opts: SetupOpts) {
       await clearCache(middlewareManifestPath)
       await writeFile(
         middlewareManifestPath,
-        JSON.stringify(
-          {
-            sortedMiddleware: [],
-            middleware: {},
-            functions: {},
-            version: 2,
-          },
-          null,
-          2
-        ),
+        JSON.stringify(middlewareManifest, null, 2),
         'utf-8'
       )
     }
@@ -420,6 +598,7 @@ async function startWatcher(opts: SetupOpts) {
         2
       )
     )
+    await currentEntriesHandling
     await writeBuildManifest()
     await writeAppBuildManifest()
     await writePagesManifest()
@@ -435,79 +614,24 @@ async function startWatcher(opts: SetupOpts) {
           ) => {
             let page = ensureOpts.match?.definition?.pathname ?? ensureOpts.page
 
-            async function loadPartialManifest<T>(
-              name: string,
-              pageName: string,
-              isApp: boolean = false,
-              isRoute: boolean = false
-            ): Promise<T> {
-              const manifestPath = path.posix.join(
-                distDir,
-                `server`,
-                isApp ? 'app' : 'pages',
-                pageName === '/' && !isApp ? 'index' : pageName,
-                isApp && pageName !== '/_not-found' && pageName !== '/not-found'
-                  ? isRoute
-                    ? 'route'
-                    : 'page'
-                  : '',
-                name
-              )
-              return JSON.parse(
-                await readFile(path.posix.join(manifestPath), 'utf-8')
-              ) as T
-            }
-
-            async function loadBuildManifest(
-              pageName: string,
-              isApp: boolean = false
-            ): Promise<void> {
-              buildManifests.set(
-                pageName,
-                await loadPartialManifest(BUILD_MANIFEST, pageName, isApp)
-              )
-            }
-
-            async function loadAppBuildManifest(
-              pageName: string
-            ): Promise<void> {
-              appBuildManifests.set(
-                pageName,
-                await loadPartialManifest(APP_BUILD_MANIFEST, pageName, true)
-              )
-            }
-
-            async function loadPagesManifest(pageName: string): Promise<void> {
-              pagesManifests.set(
-                pageName,
-                await loadPartialManifest(PAGES_MANIFEST, pageName)
-              )
-            }
-
-            async function loadAppPathManifest(
-              pageName: string,
-              routeHandler: boolean
-            ): Promise<void> {
-              appPathsManifests.set(
-                pageName,
-                await loadPartialManifest(
-                  APP_PATHS_MANIFEST,
-                  pageName,
-                  true,
-                  routeHandler
-                )
-              )
-            }
-
             if (page === '/_error') {
-              await processResult(await globalEntries.app?.writeToDisk())
+              await processResult(
+                '_app',
+                await globalEntries.app?.writeToDisk()
+              )
               await loadBuildManifest('_app')
               await loadPagesManifest('_app')
 
-              await processResult(await globalEntries.document?.writeToDisk())
+              await processResult(
+                '_document',
+                await globalEntries.document?.writeToDisk()
+              )
               await loadPagesManifest('_document')
 
-              await processResult(await globalEntries.error?.writeToDisk())
+              await processResult(
+                page,
+                await globalEntries.error?.writeToDisk()
+              )
               await loadBuildManifest('_error')
               await loadPagesManifest('_error')
 
@@ -519,56 +643,52 @@ async function startWatcher(opts: SetupOpts) {
               return
             }
 
+            await currentEntriesHandling
             const route = curEntries.get(page)
 
             if (!route) {
               // TODO: why is this entry missing in turbopack?
               if (page === '/_app') return
               if (page === '/_document') return
+              if (page === '/middleware') return
 
               throw new PageNotFoundError(`route not found ${page}`)
             }
 
             switch (route.type) {
-              case 'page':
-              case 'page-api': {
+              case 'page': {
                 if (ensureOpts.isApp) {
                   throw new Error(
                     `mis-matched route type: isApp && page for ${page}`
                   )
                 }
 
-                await processResult(await globalEntries.app?.writeToDisk())
+                await processResult(
+                  '_app',
+                  await globalEntries.app?.writeToDisk()
+                )
                 await loadBuildManifest('_app')
                 await loadPagesManifest('_app')
 
-                await processResult(await globalEntries.document?.writeToDisk())
+                await processResult(
+                  '_document',
+                  await globalEntries.document?.writeToDisk()
+                )
                 await loadPagesManifest('_document')
 
-                const writtenEndpoint =
-                  route.type === 'page-api'
-                    ? await processResult(await route.endpoint.writeToDisk())
-                    : await processResult(
-                        await route.htmlEndpoint.writeToDisk()
-                      )
+                const writtenEndpoint = await processResult(
+                  page,
+                  await route.htmlEndpoint.writeToDisk()
+                )
 
-                if (route.type === 'page') {
-                  await loadBuildManifest(page)
-                }
+                const type = writtenEndpoint?.type
+
+                await loadBuildManifest(page)
                 await loadPagesManifest(page)
-
-                switch (writtenEndpoint!.type) {
-                  case 'nodejs': {
-                    break
-                  }
-                  case 'edge': {
-                    throw new Error('edge is not implemented yet')
-                  }
-                  default: {
-                    throw new Error(
-                      `unknown endpoint type ${(writtenEndpoint as any).type}`
-                    )
-                  }
+                if (type === 'edge') {
+                  await loadMiddlewareManifest(page, 'pages')
+                } else {
+                  middlewareManifests.delete(page)
                 }
 
                 await writeBuildManifest()
@@ -578,12 +698,42 @@ async function startWatcher(opts: SetupOpts) {
 
                 break
               }
+              case 'page-api': {
+                if (ensureOpts.isApp) {
+                  throw new Error(
+                    `mis-matched route type: isApp && page for ${page}`
+                  )
+                }
+
+                const writtenEndpoint = await processResult(
+                  page,
+                  await route.endpoint.writeToDisk()
+                )
+
+                const type = writtenEndpoint?.type
+
+                await loadPagesManifest(page)
+                if (type === 'edge') {
+                  await loadMiddlewareManifest(page, 'pages')
+                } else {
+                  middlewareManifests.delete(page)
+                }
+
+                await writePagesManifest()
+                await writeMiddlewareManifest()
+                await writeOtherManifests()
+
+                break
+              }
               case 'app-page': {
-                await processResult(await route.htmlEndpoint.writeToDisk())
+                await processResult(
+                  page,
+                  await route.htmlEndpoint.writeToDisk()
+                )
 
                 await loadAppBuildManifest(page)
-                await loadBuildManifest(page, true)
-                await loadAppPathManifest(page, false)
+                await loadBuildManifest(page, 'app')
+                await loadAppPathManifest(page, 'app')
 
                 await writeAppBuildManifest()
                 await writeBuildManifest()
@@ -594,12 +744,20 @@ async function startWatcher(opts: SetupOpts) {
                 break
               }
               case 'app-route': {
-                await processResult(await route.endpoint.writeToDisk())
+                const type = (
+                  await processResult(page, await route.endpoint.writeToDisk())
+                )?.type
 
-                await loadAppPathManifest(page, true)
+                await loadAppPathManifest(page, 'app-route')
+                if (type === 'edge') {
+                  await loadMiddlewareManifest(page, 'app-route')
+                } else {
+                  middlewareManifests.delete(page)
+                }
 
                 await writeAppBuildManifest()
                 await writeAppPathsManifest()
+                await writeMiddlewareManifest()
                 await writeMiddlewareManifest()
                 await writeOtherManifests()
 
@@ -678,23 +836,6 @@ async function startWatcher(opts: SetupOpts) {
 
   let resolved = false
   let prevSortedRoutes: string[] = []
-
-  const serverFields: {
-    actualMiddlewareFile?: string | undefined
-    actualInstrumentationHookFile?: string | undefined
-    appPathRoutes?: Record<string, string | string[]>
-    middleware?:
-      | {
-          page: string
-          match: MiddlewareRouteMatch
-          matchers?: MiddlewareMatcher[]
-        }
-      | undefined
-    hasAppNotFound?: boolean
-    interceptionRoutes?: ReturnType<
-      typeof import('./filesystem').buildCustomRoute
-    >[]
-  } = {}
 
   await new Promise<void>(async (resolve, reject) => {
     if (pagesDir) {
@@ -778,14 +919,20 @@ async function startWatcher(opts: SetupOpts) {
 
       appFiles.clear()
       pageFiles.clear()
+      devPageFiles.clear()
 
-      for (const [fileName, meta] of knownFiles) {
+      const sortedKnownFiles: string[] = [...knownFiles.keys()].sort(
+        sortByPageExts(nextConfig.pageExtensions)
+      )
+
+      for (const fileName of sortedKnownFiles) {
         if (
           !files.includes(fileName) &&
           !directories.some((d) => fileName.startsWith(d))
         ) {
           continue
         }
+        const meta = knownFiles.get(fileName)
 
         const watchTime = fileWatchTimes.get(fileName)
         const watchTimeChange = watchTime && watchTime !== meta?.timestamp
@@ -882,6 +1029,9 @@ async function startWatcher(opts: SetupOpts) {
           continue
         }
 
+        // Collect all current filenames for the TS plugin to use
+        devPageFiles.add(fileName)
+
         let pageName = absolutePathToPage(fileName, {
           dir: isAppPath ? appDir! : pagesDir!,
           extensions: nextConfig.pageExtensions,
@@ -977,7 +1127,7 @@ async function startWatcher(opts: SetupOpts) {
           hotReloader.setHmrServerError(new Error(errorMessage))
         } else if (numConflicting === 0) {
           hotReloader.clearHmrServerError()
-          await propagateToWorkers('matchers.reload', undefined)
+          await propagateToWorkers('reloadMatchers', undefined)
         }
       }
 
@@ -1202,10 +1352,12 @@ async function startWatcher(opts: SetupOpts) {
           })
           .filter(Boolean) as any
 
+        const dataRoutes: typeof opts.fsChecker.dynamicRoutes = []
+
         for (const page of sortedRoutes) {
           const route = buildDataRoute(page, 'development')
           const routeRegex = getRouteRegex(route.page)
-          opts.fsChecker.dynamicRoutes.push({
+          dataRoutes.push({
             ...route,
             regex: routeRegex.re.toString(),
             match: getRouteMatcher({
@@ -1223,11 +1375,27 @@ async function startWatcher(opts: SetupOpts) {
             }),
           })
         }
+        opts.fsChecker.dynamicRoutes.unshift(...dataRoutes)
 
         if (!prevSortedRoutes?.every((val, idx) => val === sortedRoutes[idx])) {
+          const addedRoutes = sortedRoutes.filter(
+            (route) => !prevSortedRoutes.includes(route)
+          )
+          const removedRoutes = prevSortedRoutes.filter(
+            (route) => !sortedRoutes.includes(route)
+          )
+
           // emit the change so clients fetch the update
           hotReloader.send('devPagesManifestUpdate', {
             devPagesManifest: true,
+          })
+
+          addedRoutes.forEach((route) => {
+            hotReloader.send('addedPage', route)
+          })
+
+          removedRoutes.forEach((route) => {
+            hotReloader.send('removedPage', route)
           })
         }
         prevSortedRoutes = sortedRoutes
@@ -1246,7 +1414,7 @@ async function startWatcher(opts: SetupOpts) {
       } finally {
         // Reload the matchers. The filesystem would have been written to,
         // and the matchers need to re-scan it to update the router.
-        await propagateToWorkers('middleware.reload', undefined)
+        await propagateToWorkers('reloadMatchers', undefined)
       }
     })
 
@@ -1390,9 +1558,7 @@ async function startWatcher(opts: SetupOpts) {
 
   return {
     serverFields,
-
     hotReloader,
-    renderWorkers,
     requestHandler,
     logErrorWithOriginalStack,
 
